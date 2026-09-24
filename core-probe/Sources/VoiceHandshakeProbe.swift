@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import RayNeoProtocol
+import RayNeoASR
 
 /// Main queue only. Standby VAD decodes bounded audio in memory only.
 /// Legacy one-shot fixtures remain metadata-only; no disk/network audio output.
@@ -12,6 +13,14 @@ final class VoiceHandshakeProbe {
     var onArchiveTranscript: ((UUID,String,Bool) -> Void)?
     let standby = StandbyVoiceSession()
     private let cloud = CloudVoicePipeline()
+    private var localCaptionSession: LocalCaptionSession?
+    private var localFrameSequence: UInt64 = 0
+    private var localSampleOffset: UInt64 = 0
+    private var lastLocalPartialSend: TimeInterval = 0
+    private var localUtteranceID: UUID?
+    private(set) var localASRState: ASREngineState = .idle
+    var onLocalASREvent: ((ASREvent) -> Void)?
+    var onLocalASRState: ((ASREngineState) -> Void)?
     var cloudTools: (() -> [[String: Any]])? { didSet { cloud.toolDefinitions = cloudTools } }
     var executeCloudTool: ((String, String, UUID) async -> String)? { didSet { cloud.executeTool = executeCloudTool } }
     private var incrementalFixtureUntil: TimeInterval?
@@ -41,6 +50,7 @@ final class VoiceHandshakeProbe {
                 if self?.standby.enabled != true { self?.stopDisplayTest() }
             }
         standby.log = { [weak self] in self?.log?($0) }
+        standby.localCaptionEnabled = false
         cloud.log = { [weak self] in self?.log?($0) }
         cloud.onArchiveTranscript = { [weak self] id, text, final in self?.onArchiveTranscript?(id,text,final) }
         cloud.onEndpoint = { [weak self] id in self?.standby.cloudEndpoint(id:id,now:ProcessInfo.processInfo.systemUptime) }
@@ -78,6 +88,25 @@ final class VoiceHandshakeProbe {
         }
         standby.phaseChanged = { [weak self] phase in
             guard let self else { return }
+            if self.standby.localCaptionEnabled {
+                if phase == .recording {
+                    self.localUtteranceID = UUID()
+                    self.lastLocalPartialSend = 0
+                    let id = self.localUtteranceID ?? UUID()
+                    Task { @MainActor [weak self] in
+                        guard let self, let session = self.localCaptionSession else { return }
+                        do { try await session.start(utteranceID: id) }
+                        catch { self.setLocalASRState(.failed(error.localizedDescription)) }
+                    }
+                } else if self.localUtteranceID != nil {
+                    let session = self.localCaptionSession
+                    if phase == .displaying {
+                        Task { @MainActor [weak self] in await session?.finish() }
+                    } else {
+                        Task { @MainActor [weak self] in await session?.cancel() }
+                    }
+                }
+            }
             if phase == .recording {
                 let sameASR = self.standby.continuousASREnabled && self.cloud.id != nil && self.cloud.id == self.standby.cloudSessionID
                 if !sameASR {
@@ -158,6 +187,9 @@ final class VoiceHandshakeProbe {
     }
     deinit {
         cloud.cancel()
+        if let session = localCaptionSession {
+            Task { @MainActor in await session.cancel() }
+        }
         RNVoiceVADDestroy(nativeVAD)
         deadline?.cancel()
         pendingExit?.cancel()
@@ -185,7 +217,7 @@ final class VoiceHandshakeProbe {
         DispatchQueue.main.asyncAfter(deadline:.now()+90, execute:timeout)
         log?("一次性语音测试已就绪：等待真实type1唤醒，90秒过期；尚未请求收音")
     }
-    func receive(deviceID: String, metadata: BusinessEnvelopeMetadata, audio: Data? = nil,
+    @MainActor func receive(deviceID: String, metadata: BusinessEnvelopeMetadata, audio: Data? = nil,
                  arrival: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         precondition(Thread.isMainThread)
         if standby.enabled {
@@ -295,9 +327,73 @@ final class VoiceHandshakeProbe {
     func setCloudMode(_ enabled: Bool) {
         standby.cancelCurrentRound()
         cloud.cancel(clearHistory:true)
+        standby.localCaptionEnabled = false
         standby.cloudEnabled = enabled
         standby.continuousASREnabled = false; cloud.continuousASR = false
         log?(enabled ? "云模式已开启：音频→用户阿里云，文字→DeepSeek；云端句末，不用本地900ms截断" : "云模式关闭：回到本地VAD随机文字，不上传")
+    }
+    @MainActor func prepareLocalCaptions() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let session = self.ensureLocalCaptionSession()
+            await session.prepare()
+        }
+    }
+    @MainActor func cancelLocalCaptionPreparation() {
+        guard let session = localCaptionSession else { return }
+        Task { @MainActor in await session.cancel() }
+        setLocalASRState(.idle)
+    }
+    @MainActor func setLocalCaptionMode(_ enabled: Bool) {
+        if enabled && standby.cloudEnabled { setCloudMode(false) }
+        standby.cancelCurrentRound()
+        standby.localCaptionEnabled = enabled
+        guard enabled else {
+            Task { @MainActor [weak self] in await self?.localCaptionSession?.cancel() }
+            localUtteranceID = nil
+            setLocalASRState(.idle)
+            return
+        }
+        prepareLocalCaptions()
+    }
+    @MainActor private func ensureLocalCaptionSession() -> LocalCaptionSession {
+        if let localCaptionSession { return localCaptionSession }
+        let session = LocalCaptionSession()
+        session.eventHandler = { [weak self] event in self?.handleLocalASREvent(event) }
+        session.stateHandler = { [weak self] state in self?.setLocalASRState(state) }
+        localCaptionSession = session
+        return session
+    }
+    @MainActor private func setLocalASRState(_ state: ASREngineState) {
+        localASRState = state
+        onLocalASRState?(state)
+    }
+    @MainActor private func handleLocalASREvent(_ event: ASREvent) {
+        guard standby.localCaptionEnabled, event.utteranceID == localUtteranceID,
+              let target = standby.target else { return }
+        onLocalASREvent?(event)
+        let now = ProcessInfo.processInfo.systemUptime
+        let shouldSend = event.kind == .final || lastLocalPartialSend == 0 || now - lastLocalPartialSend >= 0.5
+        guard shouldSend else { return }
+        sendLocalASREvent(event, target: target, attempt: 0)
+        if event.kind == .partial { lastLocalPartialSend = now }
+    }
+    @MainActor private func sendLocalASREvent(_ event: ASREvent, target: String, attempt: Int) {
+        guard standby.localCaptionEnabled, standby.enabled, standby.target == target else { return }
+        do {
+            guard let send else { throw NSError(domain: "LocalCaptionSend", code: 1) }
+            let payload = try AssistantTextPrototype.asrText(event.text, isFinal: event.kind == .final)
+            try send(target, payload)
+        } catch {
+            if event.kind == .final, attempt < 3 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                    self?.sendLocalASREvent(event, target: target, attempt: attempt + 1)
+                }
+                log?("本地 final 字幕发送暂未提交；将在 250ms 后重试（\(attempt + 1)/3）")
+                return
+            }
+            log?("本地字幕发送失败；保留手机字幕并等待下一次 ASR 更新")
+        }
     }
     func setContinuousASR(_ enabled: Bool) {
         guard !enabled || (standby.enabled && standby.cloudEnabled) else {
@@ -308,7 +404,7 @@ final class VoiceHandshakeProbe {
         standby.continuousASREnabled = enabled; cloud.continuousASR = enabled
         log?(enabled ? "持续ASR并行实验已启用：下次唤醒持续音频→用户ASR，云起句打断，句末并行模型；无本地VAD，120秒保护" : "持续ASR实验已关闭，恢复已验收的轮流对话")
     }
-    private func processAudio(_ audio: Data?, arrival: TimeInterval) {
+    @MainActor private func processAudio(_ audio: Data?, arrival: TimeInterval) {
         let now = ProcessInfo.processInfo.systemUptime
         // Lost/delayed transport is not silence; don't endpoint on missing data.
         guard now - arrival <= 0.5 else { standby.audioDiscontinuity(); return }
@@ -328,6 +424,11 @@ final class VoiceHandshakeProbe {
                     return RNVoiceVADProcessPCM(nativeVAD,bytes.bindMemory(to:UInt8.self).baseAddress,bytes.count,&mask,samples.baseAddress,samples.count)
                 }
             }
+            if standby.localCaptionEnabled {
+                return pcm.withUnsafeMutableBufferPointer { samples in
+                    RNVoiceVADProcessPCM(nativeVAD,bytes.bindMemory(to:UInt8.self).baseAddress,bytes.count,&mask,samples.baseAddress,samples.count)
+                }
+            }
             return RNVoiceVADProcess(nativeVAD, bytes.bindMemory(to:UInt8.self).baseAddress, bytes.count, &mask)
         }
         guard frames > 0, frames <= 12 else {
@@ -339,6 +440,27 @@ final class VoiceHandshakeProbe {
         if standby.cloudEnabled {
             let data = pcm.withUnsafeBytes { Data($0.prefix(Int(frames) * 160 * 2)) }
             cloud.appendPCM(data)
+        }
+        if standby.localCaptionEnabled, let session = localCaptionSession {
+            let sampleCount = Int(frames) * 160
+            let samples = Array(pcm.prefix(sampleCount))
+            do {
+                let frame = try PCMFrame(
+                    samples: samples,
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    sampleFormat: .int16,
+                    interleaved: true,
+                    sequence: localFrameSequence,
+                    sampleOffset: localSampleOffset,
+                    timestamp: arrival
+                )
+                localFrameSequence &+= 1
+                localSampleOffset &+= UInt64(sampleCount)
+                session.append(frame)
+            } catch {
+                setLocalASRState(.failed("RayNeo PCM 格式不符合本地 ASR 输入要求。"))
+            }
         }
         guard !standby.continuousASREnabled else { return }
         for index in 0..<Int(frames) {

@@ -1,4 +1,5 @@
 import UIKit
+import RayNeoASR
 import CoreBluetooth
 import ExternalAccessory
 import RayNeoProtocol
@@ -127,12 +128,36 @@ final class ProbeController: UIViewController, CBCentralManagerDelegate, StreamD
     var companionEnabled: Bool { voiceProbe.standby.enabled }
     var companionContinuous: Bool { voiceProbe.standby.continuousASREnabled }
     var companionCloud: Bool { voiceProbe.standby.cloudEnabled }
-    func companionStart(cloud: Bool, continuous: Bool) -> Bool {
+    var companionLocalCaptionEnabled: Bool { voiceProbe.standby.localCaptionEnabled }
+    var companionLocalASRState: ASREngineState { voiceProbe.localASRState }
+    var companionLocalASRStateName: String {
+        switch voiceProbe.localASRState {
+        case .idle: return "未准备"
+        case .preparing: return "正在下载/准备模型…"
+        case .ready: return "已就绪"
+        case .loadingModel(let progress): return progress.map { "正在加载模型 \(Int($0 * 100))%" } ?? "正在加载模型…"
+        case .listening: return "正在识别"
+        case .finishing: return "正在生成最终字幕…"
+        case .failed: return "出错"
+        }
+    }
+    var companionLocalASRReady: Bool { voiceProbe.localASRState == .ready }
+    var companionLocalASRError: String? {
+        if case .failed(let message) = voiceProbe.localASRState { return message }
+        return nil
+    }
+    var companionSubtitle: ((ASREvent) -> Void)?
+    var companionLocalASRStateChanged: ((ASREngineState) -> Void)?
+    func companionPrepareLocalASR() { voiceProbe.prepareLocalCaptions() }
+    func companionCancelLocalASRPreparation() { voiceProbe.cancelLocalCaptionPreparation() }
+    func companionStart(cloud: Bool, continuous: Bool, localCaption: Bool = false) -> Bool {
         loadViewIfNeeded()
         guard companionReady, let device = core?.linkedDevices()?.first,
-              !cloud || CloudVoiceKeys.ready else { return false }
+              !cloud || CloudVoiceKeys.ready,
+              !localCaption || companionLocalASRState == .ready else { return false }
         UserDefaults.standard.set(true, forKey: "companion.autoVoice.v1")
         voiceProbe.setCloudMode(cloud)
+        voiceProbe.setLocalCaptionMode(localCaption)
         UserDefaults.standard.set(cloud, forKey: CloudVoiceKeys.enabledKey)
         UserDefaults.standard.set(continuous && cloud, forKey: "companion.continuousASR.v1")
         UserDefaults.standard.set(device.deviceID(), forKey: standbyPreferenceKey)
@@ -206,6 +231,8 @@ final class ProbeController: UIViewController, CBCentralManagerDelegate, StreamD
         #if COMPANION_DEVICE
         voiceProbe.onSubmittedCommand = { [weak self] in self?.companionCommand?($0) }
         voiceProbe.onArchiveTranscript = { [weak self] id, text, final in self?.companionTranscript?(id,text,final) }
+        voiceProbe.onLocalASREvent = { [weak self] in self?.companionSubtitle?($0) }
+        voiceProbe.onLocalASRState = { [weak self] in self?.companionLocalASRStateChanged?($0) }
         voiceProbe.cloudTools = { [weak self] in self?.companionTools?() ?? [] }
         voiceProbe.executeCloudTool = { [weak self] name, args, id in
             guard let execute = self?.companionExecuteTool else { return "Codex未配置，未执行。" }

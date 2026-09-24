@@ -21,6 +21,8 @@ packages:
     path: ../../rayneo-archive
   RayNeoAudioContainer:
     path: ../../rayneo-audio-container
+  RayNeoASR:
+    path: ../../rayneo-asr
 targets:
   RayNeoCompanion:
     type: application
@@ -105,6 +107,7 @@ targets:
       - package: ZIPFoundation
       - package: RayNeoProtocol
       - package: RayNeoDisplay
+      - package: RayNeoASR
       - framework: ../../core-probe/Frameworks/RayneoNet.framework
         embed: true
       - framework: ../../core-probe/Frameworks/CocoaAsyncSocket.framework
@@ -133,6 +136,7 @@ targets:
         OTHER_LDFLAGS: "$(inherited) $(SRCROOT)/../../core-probe/Vendor/opus-ios/libopus.a"
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
         TARGETED_DEVICE_FAMILY: "1"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
         MARKETING_VERSION: "0.2.0"
         CURRENT_PROJECT_VERSION: "2"
     info:

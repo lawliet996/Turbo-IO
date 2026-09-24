@@ -1,5 +1,8 @@
 import SwiftUI
 import Combine
+#if COMPANION_DEVICE
+import RayNeoASR
+#endif
 
 @MainActor final class CompanionVoiceRuntime: ObservableObject {
     @Published private(set) var ready = false
@@ -12,6 +15,11 @@ import Combine
     @Published private(set) var hasCredentials = false
     @Published private(set) var continuous = false
     @Published private(set) var cloud = false
+    @Published private(set) var localCaptionEnabled = false
+    @Published private(set) var localASRState = "未准备"
+    @Published private(set) var localASRReady = false
+    @Published private(set) var localASRError: String?
+    @Published private(set) var localCaptionText = ""
     @Published private(set) var latestEvent = "尚未加载设备通信核心"
     @Published var error: String?
     private let timeline: ConversationTimeline?
@@ -67,7 +75,11 @@ import Combine
         #endif
     }
     var phaseLabel: String {
-        ["disabled": "待命已关闭", "waitingForConnection": "等待认证连接", "idle": "等待眼镜唤醒",
+        if localCaptionEnabled {
+            if phase == "recording" { return "本地实时字幕识别中" }
+            if phase == "displaying" { return "字幕已同步到镜片" }
+        }
+        return ["disabled": "待命已关闭", "waitingForConnection": "等待认证连接", "idle": "等待眼镜唤醒",
          "recording": "正在听你说", "processing": "正在生成回答", "displaying": "回答已发完，可继续说"] [phase] ?? "等待状态"
     }
     func prepare() {
@@ -85,6 +97,21 @@ import Combine
             guard let self, !text.isEmpty else { return }
             if self.activeTurn != id { self.finishTimelineTurn(); self.activeTurn = id }
             self.timeline?.record(ConversationEvent(id: id, kind: .transcript, text: text, final: final))
+        }
+        controller.companionSubtitle = { [weak self] event in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.localCaptionText = event.text
+                self.transcript = event.text
+                self.transcriptFinal = event.kind == .final
+            }
+        }
+        controller.companionLocalASRStateChanged = { [weak self] state in
+            Task { @MainActor [weak self] in
+                self?.localASRState = state.name
+                self?.localASRReady = state.ready
+                self?.localASRError = state.failure
+            }
         }
         controller.companionCommand = { [weak self] command in
             guard let self else { return }
@@ -118,6 +145,10 @@ import Combine
         DisplayObservation.shared.connection(ready, phase:phase)
         if ["disabled", "waitingForConnection", "idle"].contains(phase) { finishTimelineTurn() }
         continuous = controller.companionContinuous; cloud = controller.companionCloud
+        localCaptionEnabled = controller.companionLocalCaptionEnabled
+        localASRState = controller.companionLocalASRStateName
+        localASRReady = controller.companionLocalASRReady
+        localASRError = controller.companionLocalASRError
         let current = deviceID
         if previousDeviceID != current { previousDeviceID = current; onConnectionChange?(current) }
         onRuntimeRefresh?()
@@ -138,12 +169,22 @@ import Combine
         prepare(); controller.companionReconnectBonded(); refresh()
         #endif
     }
-    func start(cloud: Bool, continuous: Bool) {
+    func prepareLocalCaptions() {
+        #if COMPANION_DEVICE
+        prepare(); controller.companionPrepareLocalASR()
+        #endif
+    }
+    func cancelLocalCaptionPreparation() {
+        #if COMPANION_DEVICE
+        controller.companionCancelLocalASRPreparation(); refresh()
+        #endif
+    }
+    func start(cloud: Bool, continuous: Bool, localCaption: Bool = false) {
         guard featureIsBusy?() != true else { error = "请先结束眼镜录音或提词器任务，再开启语音待命。"; return }
         #if COMPANION_DEVICE
         prepare()
-        guard controller.companionStart(cloud: cloud, continuous: continuous) else {
-            error = "需要唯一已认证的眼镜；云对话还需要本 App 的两项密钥。"; refresh(); return
+        guard controller.companionStart(cloud: cloud, continuous: continuous, localCaption: localCaption) else {
+            error = localCaption ? "请先准备本地 ASR 模型，并连接唯一已认证的眼镜。" : "需要唯一已认证的眼镜；云对话还需要本 App 的两项密钥。"; refresh(); return
         }
         refresh()
         #endif
@@ -176,13 +217,30 @@ import Combine
         error = "模拟器不保存真机语音凭据。"; return false
         #endif
     }
-    func clearText() { transcript = ""; answer = ""; transcriptFinal = false; modelComplete = false }
+    func clearText() { transcript = ""; localCaptionText = ""; answer = ""; transcriptFinal = false; modelComplete = false }
     private func finishTimelineTurn() {
         if let id = activeTurn { timeline?.record(ConversationEvent(id: id, kind: .interrupted)); activeTurn = nil }
     }
 }
 
 #if COMPANION_DEVICE
+private extension ASREngineState {
+    var name: String {
+        switch self {
+        case .idle: return "未准备"
+        case .preparing: return "正在下载/准备模型…"
+        case .ready: return "已就绪"
+        case .loadingModel(let progress):
+            return progress.map { "正在加载模型 \(Int($0 * 100))%" } ?? "正在加载模型…"
+        case .listening: return "正在识别"
+        case .finishing: return "正在生成最终字幕…"
+        case .failed: return "出错"
+        }
+    }
+    var ready: Bool { self == .ready }
+    var failure: String? { if case .failed(let message) = self { return message }; return nil }
+}
+
 struct VoiceDiagnosticsView: UIViewControllerRepresentable {
     let runtime: CompanionVoiceRuntime
     func makeUIViewController(context: Context) -> ProbeController { runtime.prepare(); return runtime.controller }

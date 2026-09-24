@@ -11,6 +11,7 @@ final class StandbyVoiceSession {
     var makeText: () -> String = { "待命测试 " + UUID().uuidString.prefix(8) }
     var vadEnabled = false // Set before enabling; legacy fixtures stay unchanged.
     var cloudEnabled = false
+    var localCaptionEnabled = false
     var continuousASREnabled = false // Explicit experimental opt-in, not persisted.
     private(set) var cloudSessionID: UUID?
     private(set) var cloudRoundID: UUID?
@@ -94,7 +95,7 @@ final class StandbyVoiceSession {
         followupWait = nil
         endpoint = SpeechEndpointDetector()
         noSpeechDeadline = vadEnabled && !continuousASREnabled ? now + 5 : nil
-        packets = 0; bytes = 0; round += 1; response = makeText()
+        packets = 0; bytes = 0; round += 1; response = localCaptionEnabled ? "" : makeText()
         cloudRoundID = cloudEnabled ? UUID() : nil
         cloudSessionID = cloudRoundID
         sessionDeadline = continuousASREnabled ? now + 120 : nil
@@ -115,6 +116,7 @@ final class StandbyVoiceSession {
         case .began: log?("VAD检测到语音开始；120ms/200ms窗口")
         case .ended:
             if cloudEnabled { log?("本地VAD旁路观察到停顿；由云端决定句末，不截断"); return }
+            if localCaptionEnabled { finishLocalCaption(now: now); return }
             log?("VAD检测到语音结束；连续900ms非语音；提前停止")
             finishRecording(now:now, reply:true)
         }
@@ -232,6 +234,7 @@ final class StandbyVoiceSession {
         closeRound(sendExit:true)
     }
     private func finishRecording(now: TimeInterval, reply: Bool) {
+        if localCaptionEnabled { finishLocalCaption(now: now); return }
         deadline = nil
         guard write(.stopAudio) else { failRound(); return }
         log?("持续会话type2/rc2已提交 packets=\(packets) dataBytes=\(bytes) 音频保存=0")
@@ -240,6 +243,14 @@ final class StandbyVoiceSession {
         deadline = now + 10
         setPhase(.displaying)
         log?("持续会话type5合成随机文字已提交，显示10秒；不是识别或模型回答")
+    }
+    private func finishLocalCaption(now: TimeInterval) {
+        deadline = nil
+        guard write(.stopAudio) else { failRound(); return }
+        guard packets > 0, bytes > 0 else { closeRound(sendExit: true); return }
+        deadline = now + 10
+        setPhase(.displaying)
+        log?("本地字幕停止收音并等待 ASR final；不进入问答/随机回复流程")
     }
     func executionExpired() {
         guard active else { return }

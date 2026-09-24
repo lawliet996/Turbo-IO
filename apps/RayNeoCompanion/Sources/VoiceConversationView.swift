@@ -8,10 +8,11 @@ struct ConversationView: View {
     @State private var showSimulation = false
     @State private var showDiagnostics = false
     @State private var useCloud = true
+    @State private var useLocalCaption = false
     @State private var continuous = true
     @State private var confirmStart = false
     var body: some View {
-        Screen(title: "语音会话", eyebrow: "云端断句 · 流式对话") {
+        Screen(title: "语音会话", eyebrow: useLocalCaption ? "本机实时字幕 · 流式识别" : "云端断句 · 流式对话") {
             HStack {
                 Label(runtime.phaseLabel, systemImage: runtime.enabled ? "waveform" : "moon")
                     .font(.system(size: 16, weight: .semibold))
@@ -64,10 +65,19 @@ struct ConversationView: View {
             if runtime.supportsDevice {
                 Card {
                     Toggle("使用真实云对话", isOn: $useCloud).disabled(runtime.enabled)
-                    Toggle("持续 ASR · 允许插话", isOn: $continuous).disabled(runtime.enabled || !useCloud).accessibilityIdentifier("voice-continuous-draft")
-                    Text(runtime.enabled ? (runtime.cloud && runtime.continuous ? "实际运行：持续 ASR · 有效识别新句打断" : "实际运行：非持续模式 · 输出时不保证插话") : "上方开关是下次启动配置，尚未运行")
+                    Toggle("持续 ASR · 允许插话", isOn: $continuous).disabled(runtime.enabled || !useCloud || useLocalCaption).accessibilityIdentifier("voice-continuous-draft")
+                    Toggle("本地实时字幕 · FluidAudio", isOn: $useLocalCaption)
+                        .disabled(runtime.enabled)
+                        .accessibilityIdentifier("voice-local-caption")
+                    Text("本地字幕引擎：\(runtime.localASRState)")
+                        .font(.caption).foregroundStyle(runtime.localASRError == nil ? Palette.muted : Palette.amber)
+                        .accessibilityIdentifier("voice-local-caption-status")
+                    if let message = runtime.localASRError {
+                        Text(message).font(.caption).foregroundStyle(Palette.amber)
+                    }
+                    Text(runtime.enabled ? (runtime.localCaptionEnabled ? "实际运行：本机实时字幕；不进入 AI 问答" : runtime.cloud && runtime.continuous ? "实际运行：持续 ASR · 有效识别新句打断" : "实际运行：非持续模式 · 输出时不保证插话") : "上方开关是下次启动配置，尚未运行")
                         .font(.caption).foregroundStyle(Palette.amber).accessibilityIdentifier("voice-effective-policy")
-                    Text(useCloud ? "唤醒后的音频送往已指定阿里云 ASR，识别文字送往 DeepSeek；可能计费。" : "仅本机 WebRTC VAD 检测；回复每轮随机测试串，不识别、不上传。")
+                    Text(useLocalCaption ? "首次启用会下载并准备本地 Parakeet TDT v3 多语言模型；音频只在本机处理。字幕发送到手机并同步到镜片。" : useCloud ? "唤醒后的音频送往已指定阿里云 ASR，识别文字送往 DeepSeek；可能计费。" : "仅本机 WebRTC VAD 检测；回复每轮随机测试串，不识别、不上传。")
                         .font(.caption).foregroundStyle(Palette.muted)
                     Button(runtime.hasCredentials ? "管理语音服务密钥" : "配置 ASR 和模型密钥") { showKeys = true }
                         .disabled(runtime.enabled)
@@ -76,7 +86,7 @@ struct ConversationView: View {
                     PrimaryButton(title: "关闭待命", icon: "stop.circle") { runtime.stop() }
                     Button("结束本轮，保留待命") { runtime.endRound() }
                 } else {
-                    PrimaryButton(title: "开启眼镜语音待命", icon: "waveform", enabled: runtime.ready && (!useCloud || runtime.hasCredentials)) { confirmStart = true }
+                    PrimaryButton(title: "开启眼镜语音待命", icon: "waveform", enabled: runtime.ready && (useLocalCaption ? runtime.localASRReady : (!useCloud || runtime.hasCredentials))) { confirmStart = true }
                 }
                 Button("连接与解绑管理") { showDiagnostics = true }
                 Text(runtime.latestEvent).font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.muted)
@@ -92,6 +102,10 @@ struct ConversationView: View {
         .onChange(of: runtime.enabled) { _ in reflectRunningPolicy() }
         .onChange(of: runtime.cloud) { _ in reflectRunningPolicy() }
         .onChange(of: runtime.continuous) { _ in reflectRunningPolicy() }
+        .onChange(of: useLocalCaption) { enabled in
+            if enabled { runtime.prepareLocalCaptions() }
+            else { runtime.cancelLocalCaptionPreparation() }
+        }
         .sheet(isPresented: $showConfiguration) { ModelConfigurationView() }
         .sheet(isPresented: $showSimulation) { SessionSimulationView() }
         .sheet(isPresented: $showKeys) { LiveVoiceKeysView() }
@@ -100,8 +114,8 @@ struct ConversationView: View {
             NavigationStack { VoiceDiagnosticsView(runtime: runtime).toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showDiagnostics = false } } } }
         }
         #endif
-        .confirmationDialog(useCloud ? "开启后，主动唤醒会将音频发送给阿里云，文字发送给 DeepSeek；服务可能计费。" : "开启本地随机回复测试，不上传语音。", isPresented: $confirmStart) {
-            Button("确认开启待命") { runtime.start(cloud: useCloud, continuous: continuous) }
+        .confirmationDialog(useLocalCaption ? "开启本机实时字幕。首次可能需要下载模型；音频不会进入云端 ASR 或 AI 问答。" : useCloud ? "开启后，主动唤醒会将音频发送给阿里云，文字发送给 DeepSeek；服务可能计费。" : "开启本地随机回复测试，不上传语音。", isPresented: $confirmStart) {
+            Button("确认开启待命") { runtime.start(cloud: useLocalCaption ? false : useCloud, continuous: useLocalCaption ? false : continuous, localCaption: useLocalCaption) }
         }
         .alert("语音服务", isPresented: Binding(get: { runtime.error != nil }, set: { if !$0 { runtime.error = nil } })) {
             Button("知道了", role: .cancel) {}
@@ -109,7 +123,8 @@ struct ConversationView: View {
     }
     private func reflectRunningPolicy() {
         guard runtime.enabled else { return }
-        useCloud = runtime.cloud; continuous = runtime.continuous
+        if !runtime.localCaptionEnabled { useCloud = runtime.cloud }
+        continuous = runtime.continuous; useLocalCaption = runtime.localCaptionEnabled
     }
 }
 
